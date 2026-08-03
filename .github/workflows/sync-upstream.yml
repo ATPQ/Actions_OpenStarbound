@@ -1,0 +1,46 @@
+name: Sync Upstream
+
+on:
+  workflow_dispatch:               
+  schedule:
+    - cron: '0 18 * * *'    
+
+permissions:
+  contents: write               
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.ACTIONS_PAT }}
+          fetch-depth: 0         
+
+      - name: Show times for debugging
+        run: |
+          echo "Runner UTC time: $(date -u '+%Y-%m-%d %H:%M:%S %Z')"
+          echo "Asia/Shanghai time (via TZ): $(TZ='Asia/Shanghai' date '+%Y-%m-%d %H:%M:%S %Z')"
+
+      - name: Set up git user
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Add upstream remote
+        run: |
+          git remote add upstream https://github.com/OpenStarbound/OpenStarbound.git
+
+      - name: Fetch upstream
+        run: |
+          git fetch upstream
+
+      - name: Merge upstream changes
+        run: |
+          git checkout main
+          git merge upstream/main --no-edit
+
+      - name: Push changes
+        run: |
+          git push origin main
