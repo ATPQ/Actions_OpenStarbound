@@ -22,10 +22,6 @@ on:
         type: boolean
         description: macOS
         default: false
-      release_tag:
-        type: string
-        description: Release tag/version (e.g., v1.0.0)
-        required: true
 
   push:
     paths:
@@ -1071,16 +1067,12 @@ jobs:
         id: tag
         shell: bash
         run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            TAG="${{ github.event.inputs.release_tag }}"
-          else
-            LATEST_TAG=$(curl -s https://api.github.com/repos/OpenStarbound/OpenStarbound/releases/latest | jq -r .tag_name)
-            if [ -z "$LATEST_TAG" ] || [ "$LATEST_TAG" = "null" ]; then
-              LATEST_TAG="0.1.14"
-            fi
-            DATETIME=$(date -u +'%Y%m%d%H%M')
-            TAG="${LATEST_TAG}.${DATETIME}"
+          LATEST_TAG=$(curl -s https://api.github.com/repos/OpenStarbound/OpenStarbound/releases/latest | jq -r .tag_name)
+          if [ -z "$LATEST_TAG" ] || [ "$LATEST_TAG" = "null" ]; then
+            LATEST_TAG="0.1.14"
           fi
+          DATETIME=$(date -u +'%Y%m%d%H%M')
+          TAG="${LATEST_TAG}.${DATETIME}"
           echo "tag=$TAG" >> $GITHUB_OUTPUT
           echo "Release tag: $TAG"
   
