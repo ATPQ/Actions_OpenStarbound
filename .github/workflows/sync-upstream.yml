@@ -1,12 +1,12 @@
 name: Sync Upstream
 
 on:
-  workflow_dispatch:               
+  workflow_dispatch:              
   schedule:
-    - cron: '0 18 * * *'    
+    - cron: '0 16 * * *'          
 
 permissions:
-  contents: write               
+  contents: write                 
 
 jobs:
   sync:
@@ -36,11 +36,37 @@ jobs:
         run: |
           git fetch upstream
 
+      - name: Check for new commits
+        id: check                 
+        run: |
+        
+          if git merge-base --is-ancestor upstream/main main; then
+            echo "No new commits from upstream."
+            echo "skip=true" >> $GITHUB_OUTPUT
+            echo "commit_log=" >> $GITHUB_OUTPUT   
+          else
+            # 收集新提交（最多 10 条）
+            LOG=$(git log --pretty=format:"- %h %s" main..upstream/main | head -n 10)
+            COUNT=$(git rev-list --count main..upstream/main)
+            if [ $COUNT -gt 10 ]; then
+              LOG="${LOG}\n... and $((COUNT-10)) more commits"
+            fi
+            echo "skip=false" >> $GITHUB_OUTPUT
+            # 多行文本写入输出
+            echo "commit_log<<EOF" >> $GITHUB_OUTPUT
+            echo "$LOG" >> $GITHUB_OUTPUT
+            echo "EOF" >> $GITHUB_OUTPUT
+          fi
+
       - name: Merge upstream changes
+        if: steps.check.outputs.skip == 'false'  
         run: |
           git checkout main
-          git merge upstream/main --no-edit
+         
+          cat > /tmp/commit_msg <<EOF
+          Merge upstream updates
 
-      - name: Push changes
-        run: |
+          ${{ steps.check.outputs.commit_log }}
+          EOF
+          git merge upstream/main --no-ff -F /tmp/commit_msg
           git push origin main
