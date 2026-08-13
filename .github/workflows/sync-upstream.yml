@@ -37,22 +37,19 @@ jobs:
           git fetch upstream
 
       - name: Check for new commits
-        id: check                 
+        id: check
         run: |
-        
           if git merge-base --is-ancestor upstream/main main; then
             echo "No new commits from upstream."
             echo "skip=true" >> $GITHUB_OUTPUT
-            echo "commit_log=" >> $GITHUB_OUTPUT   
+            echo "commit_log=" >> $GITHUB_OUTPUT
           else
-            # 收集新提交（最多 10 条）
-            LOG=$(git log --pretty=format:"- %h %s" main..upstream/main | head -n 10)
+            LOG=$(git log --pretty=format:"- %h %s%n%w(0,4,4)%b" -n 50 main..upstream/main)
             COUNT=$(git rev-list --count main..upstream/main)
             if [ $COUNT -gt 10 ]; then
               LOG="${LOG}\n... and $((COUNT-10)) more commits"
             fi
             echo "skip=false" >> $GITHUB_OUTPUT
-            # 多行文本写入输出
             echo "commit_log<<EOF" >> $GITHUB_OUTPUT
             echo "$LOG" >> $GITHUB_OUTPUT
             echo "EOF" >> $GITHUB_OUTPUT
