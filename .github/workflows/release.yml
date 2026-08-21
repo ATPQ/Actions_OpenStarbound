@@ -1110,14 +1110,14 @@ jobs:
             fi
             echo "Processing $src -> $dest"
             if [[ "$src" == *.tar.lz ]]; then
-              # 解压 .tar.lz 到临时目录，然后打包成 .zip
+              
               tmpdir=$(mktemp -d)
               tar -xf "$full_src" -C "$tmpdir"
 
               (cd "$tmpdir" && zip -r -q "$OLDPWD/release-zips/$dest" .)
               rm -rf "$tmpdir"
             elif [[ "$src" == *.exe ]]; then
-              # 单个 .exe 文件，直接打包成 .zip（包含该文件）
+              
               zip -j -q "release-zips/$dest" "$full_src"
             else
               cp "$full_src" "release-zips/$dest"
@@ -1131,9 +1131,12 @@ jobs:
         with:
           tag_name: ${{ steps.tag.outputs.tag }}
           name: Release ${{ steps.tag.outputs.tag }}
+          body: |
+            ## Latest Changes
+            
+            ${{ github.event.head_commit.message }}
           draft: false
           prerelease: false
-          # 上传转换后的 .zip 文件
           files: |
             release-zips/*.zip
           allow_updates: true
