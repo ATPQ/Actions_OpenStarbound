@@ -862,7 +862,7 @@ void UniverseServer::sendClientContextUpdates() {
     if (!clientContextData.empty())
       contextUpdates[p.first] = std::move(clientContextData);
     
-    if (p.second->serverDebug())
+    if (p.second->serverDebug() && p.second->netRules().version() >= 17)
       m_connectionServer->sendPackets(p.first, {make_shared<LogMapUpdate>(LogMap::getValues())});
   }
   if (!m_isLocal)
