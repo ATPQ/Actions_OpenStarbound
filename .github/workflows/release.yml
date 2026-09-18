@@ -1132,7 +1132,7 @@ jobs:
           tag_name: ${{ steps.tag.outputs.tag }}
           name: Release ${{ steps.tag.outputs.tag }}
           body: |
-            ## Latest Changes
+            ## ${{ github.event.head_commit.timestamp }}
             
             ${{ github.event.head_commit.message }}
           draft: false
@@ -1143,6 +1143,7 @@ jobs:
           fail_on_unmatched_files: false
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
   
       - name: Release Summary
         run: |
