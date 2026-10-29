@@ -152,45 +152,71 @@ jobs:
             echo "| artifacts | ${count} |"
           } >> "${GITHUB_STEP_SUMMARY}"
 
-      # ---------------------------------------------------------------- download artifacts (tolerant)
-      - name: Download required artifacts
+      # ---------------------------------------------------------------- packaging tools
+      - name: Install packaging tools
+        run: sudo apt-get update && sudo apt-get install -y lzip zip unzip
+
+      # ---------------------------------------------------------------- download client/server artifacts
+      - name: Download client/server artifacts
         id: download
         shell: bash
         env:
           RUN_ID: ${{ steps.run.outputs.run_id }}
         run: |
           set -uo pipefail
-          mkdir -p release-files
+          mkdir -p downloads artifacts
           : > omitted.txt
 
-          # Snapshot of what the upstream run actually produced.
+          # Artifact naming in this repo:
+          #   archive: false -> raw single file, artifact name already carries the extension
+          #   archive: true  -> zip container, artifact name has no extension, file lives inside
+          # Therefore: select by suffix, and only unpack when the name has no known extension.
           gh api --paginate "repos/${GITHUB_REPOSITORY}/actions/runs/${RUN_ID}/artifacts" \
-            --jq '.artifacts[].name' | sort -u > /tmp/available-artifacts.txt
-          echo "Available upstream artifacts:"
-          sed 's/^/  - /' /tmp/available-artifacts.txt
+            --jq '.artifacts[] | [.id, .name] | @tsv' > /tmp/artifacts.tsv
+
+          echo "Artifacts available in run ${RUN_ID}:"
+          cut -f2 /tmp/artifacts.tsv | sed 's/^/  - /'
 
           downloaded=0
-          while read -r name; do
+          while IFS=$'\t' read -r id name; do
             [ -n "${name}" ] || continue
 
-            # Not produced upstream (e.g. GCC variants on a plain push): record and move on.
-            if ! grep -Fxq "${name}" /tmp/available-artifacts.txt; then
-              echo "::warning::Artifact '${name}' was not produced by this run, skipping"
-              echo "${name} (not produced by the build)" >> omitted.txt
-              continue
-            fi
+            # Publish client / server / installer only; skip dev bundles and full dist archives.
+            case "${name}" in
+              *DevOnly*) echo "skip (not published): ${name}"; continue ;;
+              *-Client|*-Client.zip|*-Client.tar.lz) ;;
+              *-Server|*-Server.zip|*-Server.tar.lz) ;;
+              *-Installer|*-Installer.exe|*-Installer.zip) ;;
+              *) echo "skip (full archive): ${name}"; continue ;;
+            esac
 
-            dest="release-files/${name}"
+            dest="downloads/${name}"
             mkdir -p "${dest}"
 
             ok=0
             for attempt in 1 2 3 4 5; do
               echo "::group::${name} (attempt ${attempt})"
-              if gh run download "${RUN_ID}" \
-                   --repo "${GITHUB_REPOSITORY}" \
-                   --name "${name}" \
-                   --dir "${dest}" \
-                   --clobber; then
+              # Download by artifact id: works for both raw single-file and zip-container artifacts.
+              if curl -sSfL --retry 3 --retry-delay 5 --retry-all-errors \
+                   -H "Authorization: Bearer ${GH_TOKEN}" \
+                   -H "Accept: application/vnd.github+json" \
+                   "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/artifacts/${id}/zip" \
+                   -o /tmp/artifact.bin; then
+                case "${name}" in
+                  *.zip|*.tar.lz|*.tar.gz|*.tgz|*.7z|*.exe|*.dmg)
+                    # Raw file artifact: keep the bytes exactly as uploaded.
+                    cp /tmp/artifact.bin "${dest}/${name}"
+                    ;;
+                  *)
+                    if [ "$(head -c 2 /tmp/artifact.bin)" = "PK" ]; then
+                      # Zip container artifact: unpack the payload.
+                      unzip -o -q /tmp/artifact.bin -d "${dest}"
+                    else
+                      cp /tmp/artifact.bin "${dest}/${name}"
+                    fi
+                    ;;
+                esac
+                rm -f /tmp/artifact.bin
                 ok=1
                 echo "::endgroup::"
                 break
@@ -200,45 +226,32 @@ jobs:
               sleep $((attempt * 15))
             done
 
-            # A single failed platform must not block the others.
             if [ "${ok}" -ne 1 ]; then
-              echo "::error::Download of '${name}' failed after 5 attempts, excluding it from the release"
+              echo "::error::Download of '${name}' failed after 5 attempts - excluding it from the release"
               echo "${name} (download failed)" >> omitted.txt
               continue
             fi
 
             downloaded=$((downloaded + 1))
-          done <<'EOF'
-          OpenStarbound-Windows-Client
-          OpenStarbound-Windows-Server
-          OpenStarbound-Windows-Installer
-          OpenStarbound-macOS-Intel-Client
-          OpenStarbound-macOS-Silicon-Client
-          OpenStarbound-Linux-Clang-Client
-          OpenStarbound-Linux-Clang-Server
-          OpenStarbound-Linux-ARM-Clang-Client
-          OpenStarbound-Linux-ARM-Clang-Server
-          OpenStarbound-Linux-GCC-Client
-          OpenStarbound-Linux-GCC-Server
-          OpenStarbound-Linux-ARM-GCC-Client
-          OpenStarbound-Linux-ARM-GCC-Server
-          EOF
+          done < /tmp/artifacts.tsv
 
-          echo "Downloaded ${downloaded} artifact(s)"
+          # Flatten every layout into a single directory: artifacts/<real file name>.
+          find downloads -type f -exec cp -ft artifacts/ {} +
+
+          echo "Collected files:"
+          ls -l artifacts/
 
           {
+            echo "downloaded=${downloaded}"
             echo "omitted<<EOF_OMITTED"
             cat omitted.txt
             echo "EOF_OMITTED"
-            echo "downloaded=${downloaded}"
           } >> "${GITHUB_OUTPUT}"
 
           if [ "${downloaded}" -eq 0 ]; then
-            echo "::error::No artifact could be downloaded, aborting"
+            echo "::error::No artifact could be downloaded, nothing to publish"
             exit 1
           fi
-
-          find release-files -type f -printf '%p  %s bytes\n' | sort
 
       # ---------------------------------------------------------------- tag
       - name: Determine release tag
@@ -266,63 +279,49 @@ jobs:
           echo "Release tag: ${tag}"
 
       # ---------------------------------------------------------------- package
-      - name: Install lzip
-        run: sudo apt-get update && sudo apt-get install -y lzip
-
-      - name: Convert artifacts to .zip
+      - name: Package artifacts as .zip
         id: convert
         shell: bash
         run: |
           set -uo pipefail
-          root="$PWD"
+          root="$(pwd)"
           mkdir -p release-zips
+          shopt -s nullglob
 
-          while IFS='|' read -r src dest; do
-            [ -n "${src}" ] || continue
-            full="release-files/${src}"
-            if [ ! -e "${full}" ]; then
-              continue   # already recorded as omitted during download
-            fi
+          for src in artifacts/*; do
+            base=$(basename "${src}")
 
-            echo "Processing ${src} -> ${dest}"
+            case "${base}" in
+              *.tar.lz) dest="${base%.tar.lz}.zip" ;;
+              *.exe)    dest="${base%.exe}.zip" ;;
+              *.zip)    dest="${base}" ;;
+              *) echo "::warning::Unrecognised file '${base}', skipping"; continue ;;
+            esac
 
-            # Convert inside a subshell so a corrupt archive only skips that one package.
+            echo "Packaging ${base} -> ${dest}"
+
+            # Package inside a subshell so a corrupt archive only skips that one file.
             if ( set -e
                  tmp=$(mktemp -d)
                  trap 'rm -rf "${tmp}"' EXIT
-                 case "${src}" in
+                 case "${base}" in
                    *.tar.lz)
-                     tar --lzip -xf "${full}" -C "${tmp}"
+                     tar --lzip -xf "${src}" -C "${tmp}"
                      ( cd "${tmp}" && zip -r -q "${root}/release-zips/${dest}" . )
                      ;;
                    *.exe)
-                     zip -j -q "release-zips/${dest}" "${full}"
+                     zip -j -q "release-zips/${dest}" "${src}"
                      ;;
-                   *)
-                     cp "${full}" "release-zips/${dest}"
+                   *.zip)
+                     cp "${src}" "release-zips/${dest}"
                      ;;
-                 esac
-               ); then
+                 esac ); then
               continue
             fi
 
-            echo "::error::Failed to convert '${src}', excluding it from the release"
+            echo "::error::Failed to package '${base}' - excluding it from the release"
             echo "${dest} (packaging failed)" >> omitted.txt
-          done <<'EOF'
-          OpenStarbound-Windows-Client/OpenStarbound-Windows-Client.zip|OpenStarbound-Windows-Client.zip
-          OpenStarbound-Windows-Server/OpenStarbound-Windows-Server.zip|OpenStarbound-Windows-Server.zip
-          OpenStarbound-Windows-Installer/OpenStarbound-Windows-Installer.exe|OpenStarbound-Windows-Installer.zip
-          OpenStarbound-macOS-Intel-Client/OpenStarbound-macOS-Intel-Client.tar.lz|OpenStarbound-macOS-Intel-Client.zip
-          OpenStarbound-macOS-Silicon-Client/OpenStarbound-macOS-Silicon-Client.tar.lz|OpenStarbound-macOS-Silicon-Client.zip
-          OpenStarbound-Linux-Clang-Client/OpenStarbound-Linux-Clang-Client.tar.lz|OpenStarbound-Linux-Clang-Client.zip
-          OpenStarbound-Linux-Clang-Server/OpenStarbound-Linux-Clang-Server.tar.lz|OpenStarbound-Linux-Clang-Server.zip
-          OpenStarbound-Linux-ARM-Clang-Client/OpenStarbound-Linux-ARM-Clang-Client.tar.lz|OpenStarbound-Linux-ARM-Clang-Client.zip
-          OpenStarbound-Linux-ARM-Clang-Server/OpenStarbound-Linux-ARM-Clang-Server.tar.lz|OpenStarbound-Linux-ARM-Clang-Server.zip
-          OpenStarbound-Linux-GCC-Client/OpenStarbound-Linux-GCC-Client.tar.lz|OpenStarbound-Linux-GCC-Client.zip
-          OpenStarbound-Linux-GCC-Server/OpenStarbound-Linux-GCC-Server.tar.lz|OpenStarbound-Linux-GCC-Server.zip
-          OpenStarbound-Linux-ARM-GCC-Client/OpenStarbound-Linux-ARM-GCC-Client.tar.lz|OpenStarbound-Linux-ARM-GCC-Client.zip
-          OpenStarbound-Linux-ARM-GCC-Server/OpenStarbound-Linux-ARM-GCC-Server.tar.lz|OpenStarbound-Linux-ARM-GCC-Server.zip
-          EOF
+          done
 
           # Only abort when nothing at all was packaged.
           if ! ls release-zips/*.zip >/dev/null 2>&1; then
@@ -342,11 +341,12 @@ jobs:
       - name: Verify mandatory packages
         shell: bash
         env:
-          # Packages that must exist before a release is published.
+          # Windows is the minimum publishable target.
+          # Add "OpenStarbound-Windows-Installer.zip" here to make the installer mandatory too,
+          # but note it depends on downloading/installing Inno Setup at build time.
           REQUIRED: |
             OpenStarbound-Windows-Client.zip
             OpenStarbound-Windows-Server.zip
-            OpenStarbound-Windows-Installer.zip
         run: |
           set -uo pipefail
           missing=0
@@ -373,7 +373,7 @@ jobs:
                 [ -f "release-zips/${pkg}" ] || echo "- ${pkg}"
               done <<< "${REQUIRED}"
               echo ""
-              echo "See \`release-files/\` and the download log above for the root cause."
+              echo "Inspect \`artifacts/\` and the download log above for the root cause."
             } >> "${GITHUB_STEP_SUMMARY}"
             exit 1
           fi
