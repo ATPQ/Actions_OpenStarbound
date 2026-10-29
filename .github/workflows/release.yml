@@ -1,14 +1,40 @@
-name: Build and Release
+name: Release
 
 on:
+  # Auto: trigger whenever the Build workflow finishes.
   workflow_run:
     workflows: ["Build"]
     types: [completed]
 
+  # Manual: nothing required, resolves the latest successful Build run automatically.
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: '[optional] Build run id or URL (blank = latest successful Build run)'
+        required: false
+        default: ''
+        type: string
+      tag:
+        description: '[optional] Custom release tag (blank = auto-generated)'
+        required: false
+        default: ''
+        type: string
+      draft:
+        description: '[optional] Create as draft'
+        required: false
+        default: false
+        type: boolean
+      prerelease:
+        description: '[optional] Mark as prerelease'
+        required: false
+        default: false
+        type: boolean
+
 permissions:
   contents: write
-  actions: read          
+  actions: read
 
+# Serialize releases so an automatic and a manual run cannot race for the same tag.
 concurrency:
   group: release
   cancel-in-progress: false
@@ -17,93 +43,277 @@ jobs:
   create-release:
     name: Create GitHub Release
     runs-on: ubuntu-latest
+    # workflow_run entry: upstream must have succeeded, come from push/dispatch, and target the default branch.
+    # workflow_dispatch entry: always allowed.
     if: >-
-      github.event.workflow_run.conclusion == 'success'
-      && (github.event.workflow_run.event == 'push' || github.event.workflow_run.event == 'workflow_dispatch')
-      && github.event.workflow_run.head_branch == 'main'
+      github.event_name == 'workflow_dispatch'
+      || (
+        github.event.workflow_run.conclusion == 'success'
+        && (github.event.workflow_run.event == 'push' || github.event.workflow_run.event == 'workflow_dispatch')
+        && github.event.workflow_run.head_branch == 'main'
+      )
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      RAW_RUN_ID: ${{ github.event.workflow_run.id }}
     steps:
-      - name: Show upstream run
-        run: |
-          {
-            echo "| key | value |"
-            echo "|---|---|"
-            echo "| upstream run | ${{ github.event.workflow_run.id }} |"
-            echo "| event | ${{ github.event.workflow_run.event }} |"
-            echo "| branch | ${{ github.event.workflow_run.head_branch }} |"
-            echo "| sha | ${{ github.event.workflow_run.head_sha }} |"
-            echo "| conclusion | ${{ github.event.workflow_run.conclusion }} |"
-          } >> "$GITHUB_STEP_SUMMARY"
-
-      - name: Probe upstream artifacts
-        id: probe
+      # ---------------------------------------------------------------- resolve upstream run
+      - name: Resolve upstream Build run
+        id: run
+        shell: bash
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          INPUT_RUN_ID: ${{ inputs.run_id }}
         run: |
           set -euo pipefail
-          count=$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${{ github.event.workflow_run.id }}/artifacts" --jq '.total_count')
-          echo "count=$count" >> "$GITHUB_OUTPUT"
-          echo "upstream artifacts: $count"
-          if [ "$count" -eq 0 ]; then
-            echo "::warning::上游 run 没有任何 artifact，跳过发版"
+
+          run_id=""
+
+          if [ '${{ github.event_name }}' = 'workflow_run' ]; then
+            # Triggered by the Build workflow itself: use the run id from the event payload.
+            run_id="${RAW_RUN_ID}"
+          elif [ -n "${INPUT_RUN_ID}" ]; then
+            # Manual entry with an explicit run: accept a bare id or a full run URL.
+            run_id="${INPUT_RUN_ID##*/}"
+            echo "Using manually specified run: ${run_id}"
+          else
+            # Manual entry without input: look up the latest successful Build run.
+            echo "No run specified, resolving the latest successful Build run..."
+            wf_id=$(gh api --paginate "repos/${GITHUB_REPOSITORY}/actions/workflows" \
+                      --jq '.workflows[] | select(.name == "Build") | .id' | head -n 1)
+            if [ -z "${wf_id}" ]; then
+              echo "::error::No workflow named 'Build' found. Check the name: field in build.yml"
+              exit 1
+            fi
+            run_id=$(gh api \
+                        "repos/${GITHUB_REPOSITORY}/actions/workflows/${wf_id}/runs?status=success&per_page=1" \
+                        --jq '.workflow_runs[0].id // empty')
+            if [ -z "${run_id}" ]; then
+              echo "::error::No successful Build run available to publish"
+              exit 1
+            fi
           fi
 
-      - name: Download upstream artifacts
-        if: steps.probe.outputs.count != '0'
-        uses: actions/download-artifact@v4
-        with:
-          run-id: ${{ github.event.workflow_run.id }}
-          github-token: ${{ secrets.GITHUB_TOKEN }}
-          path: ./release-files
+          if ! [[ "${run_id}" =~ ^[0-9]+$ ]]; then
+            echo "::error::Invalid run id: ${run_id}"
+            exit 1
+          fi
 
+          json=$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${run_id}")
+          conclusion=$(jq -r '.conclusion // "unknown"' <<<"${json}")
+          sha=$(jq -r '.head_sha' <<<"${json}")
+          branch=$(jq -r '.head_branch // ""' <<<"${json}")
+          event=$(jq -r '.event' <<<"${json}")
+          url=$(jq -r '.html_url' <<<"${json}")
+          msg=$(jq -r '.head_commit.message // ""' <<<"${json}")
+
+          # Auto entry must only publish successful builds; an explicit manual run may override.
+          if [ "${conclusion}" != "success" ]; then
+            if [ '${{ github.event_name }}' = 'workflow_dispatch' ] && [ -n "${INPUT_RUN_ID}" ]; then
+              echo "::warning::Target run concluded with '${conclusion}', continuing on manual request"
+            else
+              echo "::error::Target run concluded with '${conclusion}', aborting"
+              exit 1
+            fi
+          fi
+
+          # Abort only when the run produced nothing at all; partial availability is handled later.
+          count=$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${run_id}/artifacts" --jq '.total_count')
+          if [ "${count}" -eq 0 ]; then
+            echo "::error::Target run has no artifacts, nothing to publish"
+            exit 1
+          fi
+
+          {
+            echo "run_id=${run_id}"
+            echo "sha=${sha}"
+            echo "branch=${branch}"
+            echo "event=${event}"
+            echo "conclusion=${conclusion}"
+            echo "url=${url}"
+            echo "artifact_count=${count}"
+            # Commit messages are multi-line, so use a delimiter.
+            delim="MSG_$(date +%s%N)"
+            echo "message<<${delim}"
+            printf '%s\n' "${msg}"
+            echo "${delim}"
+          } >> "${GITHUB_OUTPUT}"
+
+          {
+            echo "### Upstream Build run"
+            echo ""
+            echo "| key | value |"
+            echo "|---|---|"
+            echo "| entry | \`${{ github.event_name }}\` |"
+            echo "| run | ${url} |"
+            echo "| id | ${run_id} |"
+            echo "| conclusion | ${conclusion} |"
+            echo "| event | ${event} |"
+            echo "| branch | ${branch} |"
+            echo "| commit | \`${sha}\` |"
+            echo "| artifacts | ${count} |"
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+      # ---------------------------------------------------------------- download artifacts (tolerant)
+      - name: Download required artifacts
+        id: download
+        shell: bash
+        env:
+          RUN_ID: ${{ steps.run.outputs.run_id }}
+        run: |
+          set -uo pipefail
+          mkdir -p release-files
+          : > omitted.txt
+
+          # Snapshot of what the upstream run actually produced.
+          gh api --paginate "repos/${GITHUB_REPOSITORY}/actions/runs/${RUN_ID}/artifacts" \
+            --jq '.artifacts[].name' | sort -u > /tmp/available-artifacts.txt
+          echo "Available upstream artifacts:"
+          sed 's/^/  - /' /tmp/available-artifacts.txt
+
+          downloaded=0
+          while read -r name; do
+            [ -n "${name}" ] || continue
+
+            # Not produced upstream (e.g. GCC variants on a plain push): record and move on.
+            if ! grep -Fxq "${name}" /tmp/available-artifacts.txt; then
+              echo "::warning::Artifact '${name}' was not produced by this run, skipping"
+              echo "${name} (not produced by the build)" >> omitted.txt
+              continue
+            fi
+
+            dest="release-files/${name}"
+            mkdir -p "${dest}"
+
+            ok=0
+            for attempt in 1 2 3 4 5; do
+              echo "::group::${name} (attempt ${attempt})"
+              if gh run download "${RUN_ID}" \
+                   --repo "${GITHUB_REPOSITORY}" \
+                   --name "${name}" \
+                   --dir "${dest}" \
+                   --clobber; then
+                ok=1
+                echo "::endgroup::"
+                break
+              fi
+              echo "::endgroup::"
+              echo "::warning::Download of '${name}' failed (${attempt}/5), retrying"
+              sleep $((attempt * 15))
+            done
+
+            # A single failed platform must not block the others.
+            if [ "${ok}" -ne 1 ]; then
+              echo "::error::Download of '${name}' failed after 5 attempts, excluding it from the release"
+              echo "${name} (download failed)" >> omitted.txt
+              continue
+            fi
+
+            downloaded=$((downloaded + 1))
+          done <<'EOF'
+          OpenStarbound-Windows-Client
+          OpenStarbound-Windows-Server
+          OpenStarbound-Windows-Installer
+          OpenStarbound-macOS-Intel-Client
+          OpenStarbound-macOS-Silicon-Client
+          OpenStarbound-Linux-Clang-Client
+          OpenStarbound-Linux-Clang-Server
+          OpenStarbound-Linux-ARM-Clang-Client
+          OpenStarbound-Linux-ARM-Clang-Server
+          OpenStarbound-Linux-GCC-Client
+          OpenStarbound-Linux-GCC-Server
+          OpenStarbound-Linux-ARM-GCC-Client
+          OpenStarbound-Linux-ARM-GCC-Server
+          EOF
+
+          echo "Downloaded ${downloaded} artifact(s)"
+
+          {
+            echo "omitted<<EOF_OMITTED"
+            cat omitted.txt
+            echo "EOF_OMITTED"
+            echo "downloaded=${downloaded}"
+          } >> "${GITHUB_OUTPUT}"
+
+          if [ "${downloaded}" -eq 0 ]; then
+            echo "::error::No artifact could be downloaded, aborting"
+            exit 1
+          fi
+
+          find release-files -type f -printf '%p  %s bytes\n' | sort
+
+      # ---------------------------------------------------------------- tag
       - name: Determine release tag
-        if: steps.probe.outputs.count != '0'
         id: tag
         shell: bash
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CUSTOM_TAG: ${{ inputs.tag }}
         run: |
           set -euo pipefail
-          latest=$(gh api "repos/${GITHUB_REPOSITORY}/releases/latest" --jq '.tag_name // empty' 2>/dev/null) || latest=""
-          [ -n "$latest" ] || latest="0.1.14"
-          tag="${latest}.$(date -u +%Y%m%d%H%M%S).${{ github.run_number }}"
-          echo "tag=$tag" >> "$GITHUB_OUTPUT"
-          echo "Release tag: $tag"
+          if [ -n "${CUSTOM_TAG}" ]; then
+            tag="${CUSTOM_TAG}"
+          else
+            latest=$(gh api "repos/${GITHUB_REPOSITORY}/releases/latest" \
+                       --jq '.tag_name // empty' 2>/dev/null) || latest=""
+            [ -n "${latest}" ] || latest="0.1.14"
+            tag="${latest}.$(date -u +%Y%m%d%H%M%S).${{ github.run_number }}"
+          fi
 
+          if gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${tag}" >/dev/null 2>&1; then
+            echo "::error::Tag already exists: ${tag}"
+            exit 1
+          fi
+
+          echo "tag=${tag}" >> "${GITHUB_OUTPUT}"
+          echo "Release tag: ${tag}"
+
+      # ---------------------------------------------------------------- package
       - name: Install lzip
-        if: steps.probe.outputs.count != '0'
         run: sudo apt-get update && sudo apt-get install -y lzip
 
       - name: Convert artifacts to .zip
-        if: steps.probe.outputs.count != '0'
+        id: convert
         shell: bash
         run: |
-          set -euo pipefail
+          set -uo pipefail
           root="$PWD"
           mkdir -p release-zips
 
           while IFS='|' read -r src dest; do
-            [ -n "$src" ] || continue
-            full="release-files/$src"
-            if [ ! -e "$full" ]; then
-              echo "::warning::$full not found, skipping"
+            [ -n "${src}" ] || continue
+            full="release-files/${src}"
+            if [ ! -e "${full}" ]; then
+              continue   # already recorded as omitted during download
+            fi
+
+            echo "Processing ${src} -> ${dest}"
+
+            # Convert inside a subshell so a corrupt archive only skips that one package.
+            if ( set -e
+                 tmp=$(mktemp -d)
+                 trap 'rm -rf "${tmp}"' EXIT
+                 case "${src}" in
+                   *.tar.lz)
+                     tar --lzip -xf "${full}" -C "${tmp}"
+                     ( cd "${tmp}" && zip -r -q "${root}/release-zips/${dest}" . )
+                     ;;
+                   *.exe)
+                     zip -j -q "release-zips/${dest}" "${full}"
+                     ;;
+                   *)
+                     cp "${full}" "release-zips/${dest}"
+                     ;;
+                 esac
+               ); then
               continue
             fi
-            echo "Processing $src -> $dest"
-            tmp=$(mktemp -d)
-            case "$src" in
-              *.tar.lz)
-                tar --lzip -xf "$full" -C "$tmp"
-                ( cd "$tmp" && zip -r -q "$root/release-zips/$dest" . )
-                ;;
-              *.exe)
-                zip -j -q "release-zips/$dest" "$full"
-                ;;
-              *)
-                cp "$full" "release-zips/$dest"
-                ;;
-            esac
-            rm -rf "$tmp"
+
+            echo "::error::Failed to convert '${src}', excluding it from the release"
+            echo "${dest} (packaging failed)" >> omitted.txt
           done <<'EOF'
+          OpenStarbound-Windows-Client/OpenStarbound-Windows-Client.zip|OpenStarbound-Windows-Client.zip
+          OpenStarbound-Windows-Server/OpenStarbound-Windows-Server.zip|OpenStarbound-Windows-Server.zip
+          OpenStarbound-Windows-Installer/OpenStarbound-Windows-Installer.exe|OpenStarbound-Windows-Installer.zip
+          OpenStarbound-macOS-Intel-Client/OpenStarbound-macOS-Intel-Client.tar.lz|OpenStarbound-macOS-Intel-Client.zip
+          OpenStarbound-macOS-Silicon-Client/OpenStarbound-macOS-Silicon-Client.tar.lz|OpenStarbound-macOS-Silicon-Client.zip
           OpenStarbound-Linux-Clang-Client/OpenStarbound-Linux-Clang-Client.tar.lz|OpenStarbound-Linux-Clang-Client.zip
           OpenStarbound-Linux-Clang-Server/OpenStarbound-Linux-Clang-Server.tar.lz|OpenStarbound-Linux-Clang-Server.zip
           OpenStarbound-Linux-ARM-Clang-Client/OpenStarbound-Linux-ARM-Clang-Client.tar.lz|OpenStarbound-Linux-ARM-Clang-Client.zip
@@ -112,35 +322,106 @@ jobs:
           OpenStarbound-Linux-GCC-Server/OpenStarbound-Linux-GCC-Server.tar.lz|OpenStarbound-Linux-GCC-Server.zip
           OpenStarbound-Linux-ARM-GCC-Client/OpenStarbound-Linux-ARM-GCC-Client.tar.lz|OpenStarbound-Linux-ARM-GCC-Client.zip
           OpenStarbound-Linux-ARM-GCC-Server/OpenStarbound-Linux-ARM-GCC-Server.tar.lz|OpenStarbound-Linux-ARM-GCC-Server.zip
-          OpenStarbound-macOS-Intel-Client/OpenStarbound-macOS-Intel-Client.tar.lz|OpenStarbound-macOS-Intel-Client.zip
-          OpenStarbound-macOS-Silicon-Client/OpenStarbound-macOS-Silicon-Client.tar.lz|OpenStarbound-macOS-Silicon-Client.zip
-          OpenStarbound-Windows-Client/OpenStarbound-Windows-Client.zip|OpenStarbound-Windows-Client.zip
-          OpenStarbound-Windows-Server/OpenStarbound-Windows-Server.zip|OpenStarbound-Windows-Server.zip
-          OpenStarbound-Windows-Installer/OpenStarbound-Windows-Installer.exe|OpenStarbound-Windows-Installer.zip
           EOF
 
+          # Only abort when nothing at all was packaged.
           if ! ls release-zips/*.zip >/dev/null 2>&1; then
-            echo "::error::没有产出任何 zip，放弃发版"
+            echo "::error::No package could be produced, aborting"
             exit 1
           fi
+
           ls -lh release-zips/
 
+          {
+            echo "omitted<<EOF_OMITTED"
+            cat omitted.txt
+            echo "EOF_OMITTED"
+          } >> "${GITHUB_OUTPUT}"
+
+      # ---------------------------------------------------------------- mandatory gate
+      - name: Verify mandatory packages
+        shell: bash
+        env:
+          # Packages that must exist before a release is published.
+          REQUIRED: |
+            OpenStarbound-Windows-Client.zip
+            OpenStarbound-Windows-Server.zip
+            OpenStarbound-Windows-Installer.zip
+        run: |
+          set -uo pipefail
+          missing=0
+
+          while IFS= read -r pkg; do
+            [ -n "${pkg}" ] || continue
+            if [ -f "release-zips/${pkg}" ]; then
+              echo "OK       ${pkg}"
+            else
+              echo "::error::Mandatory package missing: ${pkg}"
+              missing=1
+            fi
+          done <<< "${REQUIRED}"
+
+          if [ "${missing}" -ne 0 ]; then
+            echo "::error::Windows packages are mandatory - aborting release, nothing will be published"
+            {
+              echo "## Release aborted"
+              echo ""
+              echo "Mandatory Windows packages are missing:"
+              echo ""
+              while IFS= read -r pkg; do
+                [ -n "${pkg}" ] || continue
+                [ -f "release-zips/${pkg}" ] || echo "- ${pkg}"
+              done <<< "${REQUIRED}"
+              echo ""
+              echo "See \`release-files/\` and the download log above for the root cause."
+            } >> "${GITHUB_STEP_SUMMARY}"
+            exit 1
+          fi
+
+      # ---------------------------------------------------------------- release notes
+      - name: Compose release notes
+        shell: bash
+        env:
+          MESSAGE: ${{ steps.run.outputs.message }}
+          OMITTED: ${{ steps.convert.outputs.omitted }}
+          SHA: ${{ steps.run.outputs.sha }}
+          BRANCH: ${{ steps.run.outputs.branch }}
+          EVENT: ${{ steps.run.outputs.event }}
+          RUN_URL: ${{ steps.run.outputs.url }}
+        run: |
+          set -uo pipefail
+          {
+            printf '%s\n\n' "${MESSAGE:-(no commit message)}"
+            echo "---"
+            echo ""
+            echo "- Commit: \`${SHA}\`"
+            echo "- From build: \`${EVENT}\` on \`${BRANCH}\`"
+            echo "- Build run: ${RUN_URL}"
+
+            if [ -n "${OMITTED}" ]; then
+              echo ""
+              echo "> [!WARNING]"
+              echo "> The following packages are **not** included in this release:"
+              echo ">"
+              while IFS= read -r line; do
+                if [ -n "${line}" ]; then
+                  echo "> - ${line}"
+                fi
+              done <<< "${OMITTED}"
+            fi
+          } > release-notes.md
+          cat release-notes.md
+
+      # ---------------------------------------------------------------- publish
       - name: Create Release
-        if: steps.probe.outputs.count != '0'
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.tag.outputs.tag }}
-          target_commitish: ${{ github.event.workflow_run.head_sha }}
+          target_commitish: ${{ steps.run.outputs.sha }}
           name: Release ${{ steps.tag.outputs.tag }}
-          body: |
-            ${{ github.event.workflow_run.head_commit.message }}
-
-            ---
-            - Commit: `${{ github.event.workflow_run.head_sha }}`
-            - Triggered by: `${{ github.event.workflow_run.event }}` on `${{ github.event.workflow_run.head_branch }}`
-            - Build run: ${{ github.event.workflow_run.html_url }}
-          draft: false
-          prerelease: false
+          body_path: release-notes.md
+          draft: ${{ inputs.draft == true }}
+          prerelease: ${{ inputs.prerelease == true }}
           make_latest: true
           fail_on_unmatched_files: false
           files: release-zips/*.zip
@@ -148,14 +429,32 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Release summary
-        if: steps.probe.outputs.count != '0'
         shell: bash
+        env:
+          OMITTED: ${{ steps.convert.outputs.omitted }}
         run: |
-          count=$(ls -1 release-zips/*.zip | wc -l)
           {
-            echo "## Release Created"
+            echo "## Release created"
             echo ""
             echo "**Tag:** ${{ steps.tag.outputs.tag }}"
-            echo "**Upstream run:** ${{ github.event.workflow_run.html_url }}"
-            echo "**Assets:** ${count}"
-          } >> "$GITHUB_STEP_SUMMARY"
+            echo "**Entry:** ${{ github.event_name }}"
+            echo "**Upstream run:** ${{ steps.run.outputs.url }}"
+            echo ""
+            echo "| asset | size |"
+            echo "|---|---|"
+            for f in release-zips/*.zip; do
+              [ -e "$f" ] || continue
+              printf '| %s | %s |\n' "$(basename "$f")" "$(du -h "$f" | cut -f1)"
+            done
+
+            if [ -n "${OMITTED}" ]; then
+              echo ""
+              echo "### Omitted packages"
+              echo ""
+              while IFS= read -r line; do
+                if [ -n "${line}" ]; then
+                  echo "- ${line}"
+                fi
+              done <<< "${OMITTED}"
+            fi
+          } >> "${GITHUB_STEP_SUMMARY}"
