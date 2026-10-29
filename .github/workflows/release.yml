@@ -416,6 +416,8 @@ jobs:
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
+          # Prefer a PAT when available; fall back to the built-in token.
+          token: ${{ secrets.ACTIONS_PAT || secrets.GITHUB_TOKEN }}
           tag_name: ${{ steps.tag.outputs.tag }}
           target_commitish: ${{ steps.run.outputs.sha }}
           name: Release ${{ steps.tag.outputs.tag }}
@@ -425,8 +427,6 @@ jobs:
           make_latest: true
           fail_on_unmatched_files: false
           files: release-zips/*.zip
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Release summary
         shell: bash
