@@ -253,21 +253,43 @@ jobs:
             exit 1
           fi
 
+
       # ---------------------------------------------------------------- tag
       - name: Determine release tag
         id: tag
         shell: bash
         env:
           CUSTOM_TAG: ${{ inputs.tag }}
+          # Base version always comes from upstream, never from this repository,
+          # so the appended timestamp can never accumulate across releases.
+          UPSTREAM_REPO: OpenStarbound/OpenStarbound
+          FALLBACK_VERSION: '0.1.14'
         run: |
           set -euo pipefail
+
           if [ -n "${CUSTOM_TAG}" ]; then
             tag="${CUSTOM_TAG}"
+            echo "Using custom tag: ${tag}"
           else
-            latest=$(gh api "repos/${GITHUB_REPOSITORY}/releases/latest" \
-                       --jq '.tag_name // empty' 2>/dev/null) || latest=""
-            [ -n "${latest}" ] || latest="0.1.14"
-            tag="${latest}.$(date -u +%Y%m%d%H%M%S).${{ github.run_number }}"
+            base=""
+            for attempt in 1 2 3; do
+              base=$(gh api "repos/${UPSTREAM_REPO}/releases/latest" \
+                       --jq '.tag_name // empty' 2>/dev/null) || base=""
+              if [ -n "${base}" ]; then
+                break
+              fi
+              echo "::warning::Could not read the latest upstream release (attempt ${attempt}/3)"
+              sleep $((attempt * 5))
+            done
+
+            if [ -z "${base}" ]; then
+              base="${FALLBACK_VERSION}"
+              echo "::warning::Falling back to base version ${base}"
+            fi
+
+            stamp=$(date -u +%Y%m%d%H%M%S)
+            tag="${base}.${stamp}"
+            echo "Upstream base: ${base}"
           fi
 
           if gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${tag}" >/dev/null 2>&1; then
