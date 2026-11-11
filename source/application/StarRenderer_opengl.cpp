@@ -342,6 +342,23 @@ void OpenGlRenderer::loadConfig(Json const& config) {
     auto tex = createGlTexture(textureAddressing,textureFiltering,initialSize);
     m_textures[pair.first] = tex;
   }
+
+  for (auto& effect : m_effects) {
+    auto fbts = effect.second.config.optArray("frameBufferTextures");
+    for (auto& texture : effect.second.textures) {
+      // a framebuffer texture listed for the effect takes the slot instead
+      bool fbTexture = false;
+      if (fbts) {
+        for (auto const& fbt : *fbts)
+          fbTexture |= fbt.optString("texture") == texture.first;
+      }
+      if (!fbTexture) {
+        if (auto tex = m_textures.ptr(texture.first))
+          texture.second.textureValue = *tex;
+      }
+    }
+  }
+
   setScreenSize(m_screenSize);
   m_config = config;
 }
